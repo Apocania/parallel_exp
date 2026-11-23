@@ -1,0 +1,11 @@
+services:
+  cartlab:
+    build: .
+    ports:
+      - "127.0.0.1:8760:8760"
+    volumes:
+      - cartlab-data:/data
+    init: true
+    stop_grace_period: 10s
+volumes:
+  cartlab-data:

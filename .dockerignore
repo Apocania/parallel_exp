@@ -1,0 +1,8 @@
+.git
+.lab-data
+.test-data
+artifacts
+__pycache__
+*.jpg
+tests
+docs
