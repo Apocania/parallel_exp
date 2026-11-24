@@ -5,6 +5,7 @@ import argparse
 import base64
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import hashlib
 import heapq
 import json
@@ -24,12 +25,21 @@ from .observations import MessageJournal
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def bounded(value, low, high):
+    if type(value) is not int or not low <= value <= high:
+        raise ValueError(f"数值须为 {low} 至 {high} 的整数")
+    return value
+
+
 class Lab:
     def __init__(self, port, node_base, data_dir, interval=10):
         self.port, self.node_base, self.interval = port, node_base, interval
         self.data_dir = Path(data_dir).resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self.delivery_lock = threading.RLock()
+        self.delivery_waiters = 0
+        self.lifecycle_lock = threading.RLock()
         self.changed = threading.Condition(self.lock)
         self.revision = 0
         self.message_revision = 0
@@ -41,6 +51,11 @@ class Lab:
         self.delay_ms, self.copies, self.reorder = 0, 1, False
         self.queue, self.sequence = [], 0
         self.pending_repairs = {}
+        self.manual = False
+        self.repair_enabled = True
+        self.link_rules = {}
+        self.recent_packets = deque(maxlen=120)
+        self.original_paths = {}
         self.broadcast_sequence = 0
         self.write_rounds = {}
         self.counters = {"enqueued": 0, "delivered": 0, "dropped": 0, "changed": 0, "overtaken": 0}
@@ -53,7 +68,7 @@ class Lab:
         self.migration = None
         self.migration_thread = None
         self.migration_cancel = threading.Event()
-        self.migration_continue = threading.Event()
+        self.migration_permit = False
         self.started = time.time()
         self.record("lab_started", "实验控制台已启动；写成功表示 1 个本地副本已持久化")
 
@@ -139,6 +154,10 @@ class Lab:
         self.url(node)
         with self.lock:
             proc = self.processes.get(node)
+            m = self.migration
+            if m and m["status"] in ("paused", "running") and node in (m["source"], m["target"]):
+                self.migration_cancel.set()
+                self.changed.notify_all()
         if proc and proc.poll() is None:
             proc.terminate()
             try:
@@ -148,16 +167,64 @@ class Lab:
                 proc.wait(timeout=2)
             self.record("node_stopped", f"节点 {node} 进程已停止，磁盘数据保留", node=node)
 
-    def configure_network(self, body):
+    @contextmanager
+    def control_delivery(self):
+        # Give operator commands the next turn after the current HTTP merge.
         with self.lock:
+            self.delivery_waiters += 1
+        try:
+            with self.delivery_lock:
+                yield
+        finally:
+            with self.lock:
+                self.delivery_waiters -= 1
+
+    def configure_network(self, body):
+        # Finish a delivery already in progress before acknowledging a pause or cut.
+        with self.control_delivery(), self.lock:
             if body.get("heal"):
                 self.blocked.clear()
                 self.delay_ms, self.copies, self.reorder = 0, 1, False
                 self.write_rounds.clear()
+                self.link_rules.clear()
+                self.manual = False
+                self.repair_enabled = True
             if "isolate" in body:
                 node = body["isolate"]
                 self.url(node)
-                self.blocked = {(a, b) for a in "ABCD" for b in "ABCD" if a != b and node in (a, b)}
+                self.blocked.update((a, b) for a in "ABCD" for b in "ABCD" if a != b and node in (a, b))
+            if "reconnect" in body:
+                node = body["reconnect"]
+                self.url(node)
+                self.blocked = {pair for pair in self.blocked if node not in pair}
+            if "link" in body:
+                link = body["link"]
+                source, target = link["source"], link["target"]
+                self.check_pair(source, target)
+                pairs = [(source, target)]
+                if link.get("both"):
+                    pairs.append((target, source))
+                for pair in pairs:
+                    if link.get("open"):
+                        self.blocked.discard(pair)
+                    else:
+                        self.blocked.add(pair)
+            if "rule" in body:
+                rule = body["rule"]
+                pair = (rule["source"], rule["target"])
+                self.check_pair(*pair)
+                if rule.get("clear"):
+                    self.link_rules.pop(pair, None)
+                else:
+                    self.link_rules[pair] = {
+                        "delay_ms": bounded(rule["delay_ms"], 0, 120000),
+                        "copies": bounded(rule["copies"], 1, 10),
+                        "drop_next": bounded(rule["drop_next"], 0, 100),
+                    }
+            if "manual" in body:
+                self.manual = bool(body["manual"])
+            if "repair_enabled" in body:
+                self.repair_enabled = bool(body["repair_enabled"])
             if "delay_ms" in body:
                 self.delay_ms = max(0, min(30000, int(body["delay_ms"])))
             if "copies" in body:
@@ -166,7 +233,7 @@ class Lab:
                 self.reorder = bool(body["reorder"])
                 self.write_rounds.clear()
             self.record("network", "网络故障设置已更新", **self.network_view())
-        if body.get("heal"):
+        if body.get("heal") or "reconnect" in body or body.get("link", {}).get("open"):
             self.kick_sync()
         return self.network_view()
 
@@ -174,11 +241,21 @@ class Lab:
         with self.lock:
             return {"blocked": [list(p) for p in sorted(self.blocked)], "delay_ms": self.delay_ms,
                     "copies": self.copies, "reorder": self.reorder, "queued": len(self.queue),
+                    "manual": self.manual, "repair_enabled": self.repair_enabled,
+                    "rules": [dict(source=a, target=b, **rule) for (a,b),rule in self.link_rules.items()],
                     "counters": dict(self.counters)}
 
-    def enqueue(self, source, carts, reason="repair", causes=()):
+    def check_pair(self, source, target):
+        self.url(source)
+        self.url(target)
+        if source == target:
+            raise ValueError("请选择两个不同节点")
+
+    def enqueue(self, source, carts, reason="repair", causes=(), destination=None):
         self.url(source)
         with self.lock:
+            if reason == "repair" and not self.repair_enabled:
+                return
             self.broadcast_sequence += 1
             broadcast = self.broadcast_sequence
             if reason == "repair":
@@ -191,8 +268,8 @@ class Lab:
                 extra = 2.0 if self.write_rounds[source] % 2 else 0
             interesting = False
             contents = public_view(carts[self.cart_id]) if self.cart_id in carts else None
-            for target in "ABCD":
-                if source == target or (target == "D" and not self.running(target)):
+            for target in destination or "ABCD":
+                if source == target or (destination is None and target == "D" and not self.running(target)):
                     continue
                 # One periodic batch per link is enough while the previous
                 # batch is still in flight. Explicit writes/retries/recovery
@@ -200,28 +277,32 @@ class Lab:
                 repair_key = (source, target)
                 if reason == "repair" and self.pending_repairs.get(repair_key, 0):
                     continue
-                for copy in range(self.copies):
-                    if len(self.queue) >= 2000:
-                        self.counters["dropped"] += 1
-                        continue
+                rule = self.link_rules.get(repair_key, {})
+                copies = rule.get("copies", self.copies)
+                delay = rule.get("delay_ms", self.delay_ms) / 1000 + extra
+                for copy in range(copies):
                     self.sequence += 1
-                    due = time.monotonic() + self.delay_ms / 1000 + extra + copy * .03
+                    wait = delay + copy * .03
+                    due = time.monotonic() + wait
                     status = "offline" if not self.running(target) else "blocked" if (source, target) in self.blocked else "queued"
-                    trace = {"group": broadcast, "source": source, "target": target,
-                             "copy": copy + 1, "copies": self.copies, "status": status,
+                    if status == "queued" and rule.get("drop_next", 0):
+                        status = "dropped"
+                        rule["drop_next"] -= 1
+                    if status == "queued" and len(self.queue) >= 2000:
+                        status = "dropped"
+                    trace = {"id": self.sequence, "group": broadcast, "source": source, "target": target,
+                             "copy": copy + 1, "copies": copies, "status": status,
                              "reason": reason, "causes": list(causes),
                              "contents": {"items": [{"sku": i["sku"], "quantity": i["quantity"]}
                                                     for i in contents["items"]],
                                           "removed": contents["tombstone_count"]} if contents else None,
                              "cart_id": self.cart_id, "created_at": time.time(),
-                             "due_at": time.time() + self.delay_ms / 1000 + extra + copy * .03,
+                             "due_at": time.time() + wait,
                              "request_ids": list(carts.get(self.cart_id, {}).get("requests", {}))}
                     if self.cart_id in carts:
                         interesting = self.journal.attach(trace, carts) or interesting
                     if status != "queued":
-                        self.counters["dropped"] += 1
-                        if reason == "repair":
-                            self.journal.background["dropped"] += 1
+                        self.failed_delivery(trace, status)
                         continue
                     heapq.heappush(self.queue, (due, self.sequence, source, target, carts, trace))
                     if reason == "repair":
@@ -229,62 +310,139 @@ class Lab:
                     self.counters["enqueued"] += 1
             if interesting:
                 self.notify_messages()
+            return broadcast
+
+    @staticmethod
+    def packet_view(trace):
+        fields = ("id", "group", "source", "target", "reason", "status", "due_at",
+                  "copy", "copies", "contents", "delivered_at", "changed", "out_of_order", "copied_from")
+        return {name: trace[name] for name in fields if name in trace}
+
+    def dispatch_view(self):
+        with self.lock:
+            return {"cart_id": self.cart_id, "network": self.network_view(),
+                    "pending": [self.packet_view(m[5]) for m in sorted(self.queue, key=lambda m: m[1])],
+                    "recent": [self.packet_view(t) for t in reversed(self.recent_packets)
+                               if t["status"] != "queued"]}
+
+    def send_snapshot(self, source, target):
+        self.check_pair(source, target)
+        cart_id = self.cart_id
+        code, state = self.call(source, "/state?" + urlencode({"cart_id": cart_id}))
+        if code != 200 or not state["ready"]:
+            raise ValueError("来源节点当前不可服务")
+        with self.lock:
+            if cart_id != self.cart_id:
+                raise ValueError("实验已复位，请重新发送")
+            group = self.enqueue(source, {cart_id: state["cart"]["raw"]}, "manual", destination=target)
+            return {"group": group}
+
+    def take_packet(self, index=0):
+        if index == 0:
+            packet = heapq.heappop(self.queue)
+        else:
+            packet = self.queue.pop(index)
+            heapq.heapify(self.queue)
+        if packet[5]["reason"] == "repair":
+            self.pending_repairs[(packet[2], packet[3])] -= 1
+        return packet
+
+    def adjust_packet(self, body):
+        action = body["action"]
+        with self.control_delivery():
+            with self.lock:
+                index = next((i for i, packet in enumerate(self.queue) if packet[1] == body["id"]), None)
+                if index is None:
+                    raise ValueError("该消息已离开队列，请查看投递结果")
+                due, seq, source, target, carts, trace = self.queue[index]
+                if action == "delay":
+                    seconds = bounded(body["delay_ms"], 0, 120000) / 1000
+                    trace["due_at"] = time.time() + seconds
+                    self.queue[index] = (time.monotonic() + seconds, seq, source, target, carts, trace)
+                    heapq.heapify(self.queue)
+                elif action == "duplicate":
+                    if len(self.queue) >= 2000:
+                        raise ValueError("队列已满")
+                    self.sequence += 1
+                    self.broadcast_sequence += 1
+                    clone = dict(trace, id=self.sequence, group=self.broadcast_sequence, copied_from=seq,
+                                 reason="duplicate", copy=1, copies=1, created_at=time.time())
+                    self.journal.attach(clone, carts)
+                    heapq.heappush(self.queue, (due, self.sequence, source, target, carts, clone))
+                    self.counters["enqueued"] += 1
+                    trace = clone
+                elif action in ("deliver", "drop"):
+                    packet = self.take_packet(index)
+                    if action == "drop":
+                        self.failed_delivery(trace, "dropped")
+                else:
+                    raise ValueError("未知消息操作")
+                self.notify_messages()
+            if action == "deliver":
+                self.deliver(packet)
+            with self.lock:
+                return self.packet_view(trace)
+
+    def failed_delivery(self, trace, status):
+        self.counters["dropped"] += 1
+        trace["status"] = status
+        if trace["reason"] != "repair" or trace.get("tracked"):
+            self.recent_packets.append(trace)
+        if trace["reason"] == "repair":
+            self.journal.background["dropped"] += 1
+        if trace.get("tracked"):
+            self.notify_messages()
 
     def relay(self):
         while not self.stopping.is_set():
-            message = None
-            with self.lock:
-                if self.queue and self.queue[0][0] <= time.monotonic():
-                    message = heapq.heappop(self.queue)
-                    if message[5]["reason"] == "repair":
-                        key = (message[2], message[3])
-                        self.pending_repairs[key] -= 1
-            if message is None:
+            with self.delivery_lock:
+                with self.lock:
+                    ready = (self.queue and not self.manual and not self.delivery_waiters
+                             and self.queue[0][0] <= time.monotonic())
+                    packet = self.take_packet() if ready else None
+                if packet is not None:
+                    self.deliver(packet)
+            if packet is None:
                 self.stopping.wait(.01)
-                continue
-            _, sequence, source, target, carts, trace = message
+
+    def deliver(self, packet):
+        _, sequence, source, target, carts, trace = packet
+        with self.lock:
+            if (source, target) in self.blocked or not self.running(target):
+                self.failed_delivery(trace, "blocked" if (source, target) in self.blocked else "offline")
+                return
+        try:
+            code, result = self.call(target, "/internal/merge",
+                                     {"source": source, "carts": carts, "causes": trace["causes"]}, timeout=2)
+        except (OSError, ValueError):
             with self.lock:
-                if (source, target) in self.blocked or not self.running(target):
-                    self.counters["dropped"] += 1
-                    trace["status"] = "dropped"
-                    if trace.get("tracked"):
-                        self.notify_messages()
-                    continue
-            try:
-                code, result = self.call(target, "/internal/merge",
-                                         {"source": source, "carts": carts, "causes": trace["causes"]}, timeout=.8)
-                with self.lock:
-                    if code != 200:
-                        self.counters["dropped"] += 1
-                        trace["status"] = "rejected"
-                        if trace.get("tracked"):
-                            self.notify_messages()
-                        continue
-                    self.counters["delivered"] += 1
-                    trace["status"] = "delivered"
-                    trace["delivered_at"] = time.time()
-                    trace["changed"] = any(c["cart_id"] == trace["cart_id"] for c in result["changed"])
-                    new_receipt = self.journal.delivered(trace, carts)
-                    if trace["reason"] == "repair":
-                        self.journal.background["delivered"] += 1
-                        self.journal.background["changed"] += int(bool(result["changed"]))
-                    key = (source, target)
-                    if sequence < self.last_delivered.get(key, 0):
-                        self.counters["overtaken"] += 1
-                        trace["out_of_order"] = True
-                    self.last_delivered[key] = max(sequence, self.last_delivered.get(key, 0))
-                    if result["changed"]:
-                        self.counters["changed"] += 1
-                        self.record("merged", f"{source} → {target}：副本状态已合并",
-                                    source=source, target=target, carts=result["changed"])
-                    if trace.get("tracked") or new_receipt:
-                        self.notify_messages()
-            except (OSError, ValueError):
-                with self.lock:
-                    self.counters["dropped"] += 1
-                    trace["status"] = "dropped"
-                    if trace.get("tracked"):
-                        self.notify_messages()
+                self.failed_delivery(trace, "dropped")
+            return
+        with self.lock:
+            if code != 200:
+                self.failed_delivery(trace, "rejected")
+                return
+            self.counters["delivered"] += 1
+            trace["status"] = "delivered"
+            trace["delivered_at"] = time.time()
+            if trace["reason"] != "repair" or trace.get("tracked"):
+                self.recent_packets.append(trace)
+            trace["changed"] = any(c["cart_id"] == trace["cart_id"] for c in result["changed"])
+            new_receipt = self.journal.delivered(trace, carts)
+            if trace["reason"] == "repair":
+                self.journal.background["delivered"] += 1
+                self.journal.background["changed"] += int(bool(result["changed"]))
+            key = (source, target)
+            if sequence < self.last_delivered.get(key, 0):
+                self.counters["overtaken"] += 1
+                trace["out_of_order"] = True
+            self.last_delivered[key] = max(sequence, self.last_delivered.get(key, 0))
+            if result["changed"]:
+                self.counters["changed"] += 1
+                self.record("merged", f"{source} → {target}：副本状态已合并",
+                            source=source, target=target, carts=result["changed"])
+            if trace.get("tracked") or new_receipt:
+                self.notify_messages()
 
     def node_state(self, node, cart_id):
         if not self.running(node):
@@ -349,109 +507,162 @@ class Lab:
                                  "ambiguous": True, "request_id": payload["request_id"]}
         return code, result
 
-    def new_experiment(self):
-        self.cancel_migration()
-        self.stop_node("D")
-        self.configure_network({"heal": True})
-        with self.lock:
-            self.drop_reply.clear()
-            self.migration = None
-            self.journal = MessageJournal()
-            self.notify_messages()
-            self.cart_id = "demo-" + uuid.uuid4().hex[:10]
-            cart_id = self.cart_id
-        for node in "ABC":
-            if not self.running(node):
-                self.start_node(node)
-            self.call(node, "/internal/clock", {"offset": 0})
-        code, result = self.operation({"node": "A", "cart_id": cart_id, "request_id": uuid.uuid4().hex,
-                                       "operation": {"kind": "add", "sku": "milk"}})
-        if code != 200:
-            raise RuntimeError("could not seed experiment")
-        self.record("experiment", "新实验已准备：同一用户，初始购物车包含 1 份牛奶", cart_id=cart_id)
-        return {"cart_id": cart_id, "seed": result}
+    def new_experiment(self, seed=True):
+        with self.lifecycle_lock:
+            self.cancel_migration()
+            self.stop_node("D")
+            # Reattach the pre-import databases if a free experiment replaced
+            # an ordinary replica. Every staging database remains on disk.
+            for node, path in self.original_paths.items():
+                self.stop_node(node)
+                self.database_paths[node] = path
+            self.original_paths.clear()
+            with self.control_delivery(), self.lock:
+                self.queue.clear()
+                self.pending_repairs.clear()
+                self.recent_packets.clear()
+                self.last_delivered.clear()
+                self.drop_reply.clear()
+                self.migration = None
+                self.journal = MessageJournal()
+                self.cart_id = "demo-" + uuid.uuid4().hex[:10]
+                cart_id = self.cart_id
+                self.events.clear()
+                self.counters = dict.fromkeys(self.counters, 0)
+                self.notify_messages()
+            self.configure_network({"heal": True})
+            for node in "ABC":
+                if not self.running(node):
+                    self.start_node(node)
+                self.call(node, "/internal/clock", {"offset": 0})
+            result = None
+            if seed:
+                code, result = self.operation({"node": "A", "cart_id": cart_id, "request_id": uuid.uuid4().hex,
+                                               "operation": {"kind": "add", "sku": "milk"}})
+                if code != 200:
+                    raise RuntimeError("could not seed experiment")
+            detail = "初始购物车包含 1 份牛奶" if seed else "空购物车，链路与时钟已复位"
+            self.record("experiment", "新实验已准备：" + detail, cart_id=cart_id)
+            return {"cart_id": cart_id, "seed": result}
 
     def cancel_migration(self):
         self.migration_cancel.set()
+        with self.changed:
+            self.changed.notify_all()
         if self.migration_thread and self.migration_thread.is_alive():
-            self.migration_thread.join(timeout=3)
+            self.migration_thread.join(timeout=4)
             if self.migration_thread.is_alive():
                 raise RuntimeError("previous migration is still stopping")
 
-    def begin_migration(self, fresh=False, pause_after=None):
-        if fresh:
-            self.cancel_migration()
-            self.stop_node("D")
-            directory = self.data_dir / "import-runs"
-            directory.mkdir(exist_ok=True)
-            self.database_paths["D"] = directory / ("D-" + uuid.uuid4().hex + ".sqlite3")
+    def begin_migration(self, fresh=False, pause_after=None, source="A", target="D", manual=False):
+        self.check_pair(source, target)
         with self.lock:
-            if self.migration_thread and self.migration_thread.is_alive():
-                raise ValueError("migration already running")
-        self.start_node("D", joining=True)
-        if self.call("D", "/health")[1]["ready"]:
-            raise ValueError("D 已完成加入；重新选择迁移实验可使用新数据库再次演示")
-        code, snapshot = self.call("A", "/internal/snapshot")
+            if self.migration and self.migration["status"] in ("paused", "running"):
+                raise ValueError("当前迁移仍在进行，请先中断或完成")
+            if (source, target) in self.blocked:
+                raise ValueError("迁移方向的链路已断开")
+        if not self.running(source) or not self.call(source, "/health")[1]["ready"]:
+            raise ValueError("请选择可服务的快照来源")
+        code, snapshot = self.call(source, "/internal/snapshot")
         if code != 200:
             raise RuntimeError("source unavailable")
         raw = canonical(snapshot["carts"]).encode()
-        # At least 8 chunks make mid-transfer failure observable, even with a
-        # small demo cart. A fresh snapshot is taken on each retry.
-        size = max(1, (len(raw) + 7) // 8)
-        chunks = [raw[i:i + size] for i in range(0, len(raw), size)]
-        if pause_after is not None and (type(pause_after) is not int or not 0 < pause_after < len(chunks)):
-            raise ValueError("pause_after must be between the first and final chunk")
+        total = min(8, len(raw))
+        chunks = [raw[i * len(raw) // total:(i + 1) * len(raw) // total] for i in range(total)]
+        if pause_after is not None:
+            bounded(pause_after, 1, total - 1)
+        self.cancel_migration()
+        if fresh:
+            self.stop_node(target)
+            directory = self.data_dir / "import-runs"
+            directory.mkdir(exist_ok=True)
+            self.original_paths.setdefault(target, self.database_paths.get(target, self.data_dir / f"node-{target}.sqlite3"))
+            self.database_paths[target] = directory / (target + "-" + uuid.uuid4().hex + ".sqlite3")
+        self.start_node(target, joining=True)
+        if self.call(target, "/health")[1]["ready"]:
+            raise ValueError("目标已经在服务，请使用新的导入库")
         job = uuid.uuid4().hex
-        code, result = self.call("D", "/internal/migration/begin",
-                                 {"job": job, "total": len(chunks), "digest": hashlib.sha256(raw).hexdigest()})
+        code, result = self.call(target, "/internal/migration/begin",
+                                 {"job": job, "total": total, "digest": hashlib.sha256(raw).hexdigest()})
         if code != 200:
             raise ValueError(result.get("error", "migration refused"))
-        self.migration = {"job": job, "status": "running", "sent": 0, "total": len(chunks)}
-        self.migration_cancel = threading.Event()
-        self.migration_continue = threading.Event()
-        cancelled = self.migration_cancel
-        continued = self.migration_continue
-        self.record("migration", "D 开始导入快照；完成校验和提交前不提供购物车服务")
+        with self.lock:
+            self.migration = {"job": job, "source": source, "target": target, "status": "paused" if manual else "running",
+                              "manual": manual, "sent": 0, "total": total}
+            self.migration_permit = False
+            self.migration_cancel = threading.Event()
+            job_state = self.migration
+            cancelled = self.migration_cancel
+        self.record("migration", f"{source} → {target} 已取得快照；目标进入暂存阶段")
 
         def transfer():
             try:
-                for i, chunk in enumerate(chunks):
-                    if self.stopping.is_set():
-                        return
-                    if cancelled.wait(.5):
-                        raise RuntimeError("import cancelled for a new experiment")
-                    code, result = self.call("D", "/internal/migration/chunk",
-                                             {"job": job, "part": i, "data": base64.b64encode(chunk).decode()})
-                    if code != 200:
-                        raise RuntimeError(result.get("error", "chunk rejected"))
-                    with self.lock:
-                        self.migration["sent"] = i + 1
-                        self.invalidate()
-                    if pause_after == i + 1:
-                        with self.lock:
-                            self.migration["status"] = "paused"
+                for index in range(total + 1):
+                    with self.changed:
+                        if job_state["manual"] and not self.migration_permit:
+                            job_state["status"] = "paused"
                             self.invalidate()
-                        while not continued.wait(.1):
-                            if cancelled.is_set() or self.stopping.is_set() or not self.running("D"):
-                                raise RuntimeError("target stopped at the import checkpoint")
-                        with self.lock:
-                            self.migration["status"] = "running"
-                code, result = self.call("D", "/internal/migration/commit", {"job": job})
-                if code != 200:
-                    raise RuntimeError(result.get("error", "commit rejected"))
+                        while job_state["manual"] and not self.migration_permit and not cancelled.is_set():
+                            self.changed.wait(.2)
+                        self.migration_permit = False
+                        job_state["status"] = "running"
+                    if cancelled.is_set() or self.stopping.is_set():
+                        raise RuntimeError("操作员中断或节点已停止")
+                    if not job_state["manual"] and cancelled.wait(.45):
+                        raise RuntimeError("导入已中断")
+                    with self.lock:
+                        if (source, target) in self.blocked or not self.running(source):
+                            raise RuntimeError("来源离线或迁移链路已断开")
+                    if index == total:
+                        code, result = self.call(target, "/internal/migration/commit", {"job": job})
+                    else:
+                        code, result = self.call(target, "/internal/migration/chunk",
+                                                 {"job": job, "part": index,
+                                                  "data": base64.b64encode(chunks[index]).decode()})
+                    if code != 200:
+                        raise RuntimeError(result.get("error", "目标拒收"))
+                    with self.lock:
+                        if index < total:
+                            job_state["sent"] = index + 1
+                            if pause_after == index + 1:
+                                job_state["manual"] = True
+                        self.invalidate()
                 with self.lock:
-                    self.migration["status"] = "complete"
-                self.record("migration", "D 快照已完整提交，开始正常同步并接收请求")
+                    job_state["status"] = "complete"
+                self.record("migration", f"{target} 已校验并提交完整快照，开始补同步")
                 self.kick_sync()
             except (OSError, ValueError, RuntimeError) as exc:
                 with self.lock:
-                    self.migration["status"] = "interrupted"
-                    self.migration["error"] = str(exc)
-                self.record("migration_interrupted", "D 导入中断；已接收片段仍处于暂存区，可重新导入")
+                    job_state.update(status="interrupted", error=str(exc))
+                self.record("migration_interrupted", f"{target} 导入中断，暂存数据保留")
 
         self.migration_thread = threading.Thread(target=transfer, daemon=True)
         self.migration_thread.start()
-        return dict(self.migration)
+        with self.lock:
+            return dict(job_state)
+
+    def control_migration(self, action, job=None):
+        with self.changed:
+            m = self.migration
+            if not m or m["status"] not in ("paused", "running") or (job and job != m["job"]):
+                raise ValueError("当前没有可操作的迁移任务")
+            if action in ("step", "commit"):
+                if m["status"] != "paused":
+                    raise ValueError("请等待当前分片完成")
+                if (m["sent"] == m["total"]) != (action == "commit"):
+                    raise ValueError("先接收全部分片，再校验提交")
+                self.migration_permit = True
+                m["status"] = "running"
+            elif action == "resume":
+                m.update(manual=False, status="running")
+            elif action == "pause":
+                m["manual"] = True
+            elif action == "cancel":
+                self.migration_cancel.set()
+            else:
+                raise ValueError("未知迁移操作")
+            self.invalidate()
+            return dict(m)
 
     def close(self):
         self.stopping.set()
@@ -504,6 +715,8 @@ class LabHandler(JsonHandler):
                 self.send_json(lab.status(valid_id(query["cart_id"][0]) if "cart_id" in query else None))
             elif parsed.path == "/api/messages":
                 self.send_json(lab.messages(valid_id(query["cart_id"][0]) if "cart_id" in query else None))
+            elif parsed.path == "/api/dispatch":
+                self.send_json(lab.dispatch_view())
             elif parsed.path == "/api/health":
                 self.send_json({"ok": True, "service": "cartlab"})
             elif parsed.path == "/api/cas":
@@ -512,9 +725,9 @@ class LabHandler(JsonHandler):
                 self.send_json(result, code)
             elif parsed.path == "/guide":
                 self.send_bytes((ROOT / "docs" / "实验讲解详解.html").read_bytes(), "text/html; charset=utf-8")
-            elif parsed.path in ("/", "/app.js", "/scenarios.js", "/lessons.js", "/style.css"):
-                file = "index.html" if parsed.path == "/" else parsed.path[1:]
-                mime = "text/html" if parsed.path == "/" else "text/css" if file.endswith(".css") else "application/javascript"
+            elif parsed.path in ("/", "/free", "/free.js", "/free.css", "/app.js", "/scenarios.js", "/lessons.js", "/style.css"):
+                file = {"/": "index.html", "/free": "free.html"}.get(parsed.path, parsed.path[1:])
+                mime = "text/html" if file.endswith(".html") else "text/css" if file.endswith(".css") else "application/javascript"
                 self.send_bytes((ROOT / "web" / file).read_bytes(), mime + "; charset=utf-8")
             elif parsed.path == "/favicon.ico":
                 self.send_bytes(b"", "image/x-icon", 204)
@@ -538,34 +751,48 @@ class LabHandler(JsonHandler):
             elif self.path == "/api/network":
                 self.send_json(lab.configure_network(body))
             elif self.path == "/api/experiment/new":
-                self.send_json(lab.new_experiment())
+                self.send_json(lab.new_experiment(seed=body.get("seed", True)))
+            elif self.path == "/api/dispatch/send":
+                self.send_json(lab.send_snapshot(body["source"], body["target"]))
+            elif self.path == "/api/dispatch/packet":
+                self.send_json(lab.adjust_packet(body))
             elif self.path == "/api/node":
                 node = body["node"]
-                if body["action"] == "stop":
-                    lab.stop_node(node)
-                elif body["action"] == "start":
-                    lab.start_node(node, joining=node == "D")
-                else:
-                    raise ValueError("unknown action")
+                with lab.lifecycle_lock:
+                    if body["action"] == "stop":
+                        lab.stop_node(node)
+                    elif body["action"] == "start":
+                        lab.start_node(node, joining=body.get("joining", node == "D"))
+                    else:
+                        raise ValueError("unknown action")
                 self.send_json({"ok": True})
             elif self.path == "/api/fault/reply":
                 lab.url(body["node"])
                 with lab.lock:
-                    lab.drop_reply.add(body["node"])
-                lab.record("fault", f"已设置：丢弃 {body['node']} 的下一次成功写入响应")
+                    if body.get("enabled", True):
+                        lab.drop_reply.add(body["node"])
+                    else:
+                        lab.drop_reply.discard(body["node"])
+                lab.record("fault", f"{body['node']} 的响应丢失设置已更新")
                 self.send_json({"ok": True})
             elif self.path == "/api/fault/clock":
                 code, result = lab.call(body["node"], "/internal/clock", {"offset": body["offset"]})
-                lab.record("clock", f"节点 {body['node']} 的实验时钟偏移设为 {body['offset']} 秒")
+                if code == 200:
+                    lab.record("clock", f"节点 {body['node']} 的实验时钟偏移设为 {body['offset']} 秒")
                 self.send_json(result, code)
             elif self.path == "/api/cas":
                 code, result = lab.call(body["node"], "/cas", body)
                 self.send_json(result, code)
             elif self.path == "/api/migration/start":
-                self.send_json(lab.begin_migration(fresh=bool(body.get("fresh")), pause_after=body.get("pause_after")))
-            elif self.path == "/api/migration/resume":
-                lab.migration_continue.set()
-                self.send_json({"ok": True})
+                with lab.lifecycle_lock:
+                    result = lab.begin_migration(fresh=bool(body.get("fresh")), pause_after=body.get("pause_after"),
+                                                 source=body.get("source", "A"), target=body.get("target", "D"),
+                                                 manual=bool(body.get("manual")))
+                self.send_json(result)
+            elif self.path in ("/api/migration/resume", "/api/migration/control"):
+                with lab.lifecycle_lock:
+                    self.send_json(lab.control_migration("resume" if self.path.endswith("/resume") else body["action"],
+                                                         body.get("job")))
             elif self.path == "/api/lab/shutdown":
                 self.send_json({"ok": True})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()

@@ -171,7 +171,10 @@ function renderReplicas() {
 }
 function renderNetwork() {
   const net=state.network, faults=[];
-  if(net.blocked.length) faults.push("A 与其他节点断开");
+  if(net.blocked.length) faults.push("断开的方向："+net.blocked.map(([a,b])=>a+"→"+b).join("、"));
+  if(net.manual) faults.push("自动投递已暂停");
+  if(net.repair_enabled===false) faults.push("周期补同步已暂停");
+  if(net.rules?.length) faults.push(net.rules.length+" 条单向传输规则");
   if(net.delay_ms) faults.push("消息延迟 "+net.delay_ms/1000+" 秒");
   if(net.copies>1) faults.push("同一消息投递 "+net.copies+" 份");
   if(net.reorder) faults.push("乱序开启");
@@ -179,15 +182,16 @@ function renderNetwork() {
   $("network-badge").className="pill "+(faults.length?"amber":"green");
   $("communication").textContent=net.blocked.length?"已分区":faults.length?"有故障":"正常";
   $("fault-summary").textContent=faults.join("；")||"节点之间正常通信。写入后立即触发同步。";
-  const positions={A:[35,48],B:[160,20],C:[160,76]};
-  html("topology",`<svg viewBox="0 0 200 96" role="img" aria-label="节点实际通信关系">${[["A","B"],["A","C"],["B","C"]].map(([a,b])=>{
-    const off=!getNode(state,a).online||!getNode(state,b).online, blocked=net.blocked.some(([s,t])=>s===a&&t===b);
+  const positions={A:[26,44],B:[100,18],C:[100,76]};
+  if(getNode(state,"D")?.online) positions.D=[177,47];
+  const pairs=Object.keys(positions).flatMap((a,i)=>Object.keys(positions).slice(i+1).map(b=>[a,b]));
+  html("topology",`<svg viewBox="0 0 200 96" role="img" aria-label="节点实际通信关系">${pairs.map(([a,b])=>{
+    const off=!getNode(state,a).online||!getNode(state,b).online, blocked=net.blocked.some(([s,t])=>(s===a&&t===b)||(s===b&&t===a));
     return `<line x1="${positions[a][0]}" y1="${positions[a][1]}" x2="${positions[b][0]}" y2="${positions[b][1]}" stroke="${off?"#b2b8b7":blocked?"#c8854c":"#65a28d"}" stroke-width="2" ${off||blocked?'stroke-dasharray="5 5"':""}/>`;
   }).join("")}${Object.entries(positions).map(([n,[x,y]])=>`<circle cx="${x}" cy="${y}" r="15" fill="${getNode(state,n).online?"#e1f3e8":"#e5e7e5"}"/><text x="${x}" y="${y+4}" fill="#38564d" text-anchor="middle" font-size="12" font-weight="bold">${n}</text>`).join("")}</svg>`);
-  $("duplicates").checked=net.copies===3; $("delay").checked=net.delay_ms>=10000; $("reorder").checked=net.reorder;
   $("queue-count").textContent=net.queued; $("delivered-count").textContent=net.counters.delivered; $("dropped-count").textContent=net.counters.dropped;
   const m=state.migration;
-  html("migration-status",m?`<b>D：${{running:"正在导入",paused:"已暂停，等待中途宕机",interrupted:"导入中断，尚不可用",complete:"导入完成，已开放服务"}[m.status]||m.status}</b> · ${m.sent}/${m.total}<div class="progress-track"><span style="width:${100*m.sent/m.total}%"></span></div>`:"");
+  html("migration-status",m?`<b>${escapeHtml(m.target||"D")}：${{running:"正在导入",paused:"已暂停",interrupted:"导入中断，尚不可用",complete:"导入完成，已开放服务"}[m.status]||m.status}</b> · ${m.sent}/${m.total}<div class="progress-track"><span style="width:${100*m.sent/m.total}%"></span></div>`:"");
 }
 function renderMessages() {
   if(!state) return;
@@ -265,7 +269,6 @@ function renderGuide() {
   $("guide-result").textContent=sceneError?"未通过："+sceneError:busy?"正在读取实际节点状态，结果验证通过后才进入下一步。":evidence.length?"已验证 · "+evidence.at(-1).result:"实际结果将在执行后显示；上方“应该看到”只是预期。";
   html("guide-history",evidence.map(e=>`<li><b>${escapeHtml(e.action)}</b>：${escapeHtml(e.result)}</li>`).join(""));
   $("guide-concept").textContent=scene.concept;
-  document.querySelectorAll(".free-controls button,.free-controls input").forEach(e=>e.disabled=busy);
 }
 function render() {
   if(!state) return;
@@ -393,16 +396,6 @@ $("raw-message-details").ontoggle=()=>{if($("raw-message-details").open) readMes
 $("refresh-message-log").onclick=()=>action(readMessageLog);
 $("guide-next").onclick=()=>action(guidedNext);
 $("new-experiment").onclick=()=>action(()=>selectScene(scene.id));
-$("isolate").onclick=()=>action(()=>runner.network({isolate:"A"}));
-$("heal").onclick=()=>action(()=>runner.network({heal:true}));
-$("duplicates").onchange=e=>action(()=>runner.network({copies:e.target.checked?3:1}));
-$("delay").onchange=e=>action(()=>runner.network({delay_ms:e.target.checked?10000:0}));
-$("reorder").onchange=e=>action(()=>runner.network({reorder:e.target.checked}));
-$("lose-reply").onclick=()=>action(()=>api("/api/fault/reply",{node:"A"}));
-$("rollback-clock").onclick=()=>action(()=>api("/api/fault/clock",{node:"A",offset:-60}));
-$("restore-clock").onclick=()=>action(()=>api("/api/fault/clock",{node:"A",offset:0}));
-$("cas-test").onclick=()=>action(()=>selectScene("cas"));
-$("join-node").onclick=()=>action(()=>selectScene("migration"));
 for(const client of ["phone","desktop"]) $(client+"-node").onchange=()=>{if(state){renderClient(client);renderComparison();}};
 $("export").onclick=()=>{
   if(!state) return toast("尚无可导出的观测。",true);

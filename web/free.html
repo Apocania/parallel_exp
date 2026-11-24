@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>自由实验台 · CartLab</title>
+  <link rel="stylesheet" href="/free.css">
+  <script src="/free.js" defer></script>
+</head>
+<body>
+<header class="mast">
+  <div class="mast-inner"><div class="mast-brand"><a href="/" class="brand">CartLab</a><span class="slash">/</span><h1>自由实验台</h1></div>
+    <div class="mast-actions"><span id="connection" role="status">连接中</span><button id="dispatch-mode" class="mode">暂停自动投递</button><button id="reset" class="reset" title="新建空车，清理队列、故障和迁移，恢复默认节点">↺ 一键复位</button></div>
+  </div>
+  <nav class="jump-bar" aria-label="窗口定位">
+    <a href="#phone-window">手机 <b id="phone-mini">—</b></a><a href="#desktop-window">桌面 <b id="desktop-mini">—</b></a><a href="#control-desk">实验工具</a><span id="mini-comparison"></span>
+  </nav>
+</header>
+<main>
+  <div class="lab-layout">
+    <section class="stage" id="clients-panel" aria-labelledby="stage-title">
+      <div class="stage-heading"><div><h2 id="stage-title">双端购物车</h2><div class="cart-key">同一购物车 <code id="cart-key">…</code></div></div>
+        <div class="compare" id="comparison" data-tone="muted" role="status"><strong id="compare-title">等待读取</strong><span id="compare-detail"></span></div>
+      </div>
+      <div class="device-grid" id="client-list"></div>
+      <details class="stage-details"><summary>副本实读与版本 <span id="overview"></span></summary>
+        <div id="replica-list"></div>
+        <details><summary>查看版本、商品标记与删除记录</summary><pre id="raw-state"></pre></details>
+      </details>
+      <details class="stage-details recipes"><summary>如何自行验证各项实验</summary>
+        <label>选择一个现象<select id="recipe-choice"></select></label><div id="recipe-content"></div>
+      </details>
+    </section>
+    <aside class="instruments" id="control-desk" aria-labelledby="console-title">
+      <div class="console-head"><h2 id="console-title">实验工具</h2><span id="control-status" role="status"></span></div>
+      <nav id="tools" aria-label="自由实验工具">
+        <button data-tab="nodes" aria-current="page">节点与链路</button><button data-tab="packets">消息队列 <b id="queue-badge">0</b></button><button data-tab="cas">CAS 竞争</button><button data-tab="import">分步迁移</button><button data-tab="load">热点压测</button><button data-tab="history">观测记录</button>
+      </nav>
+      <div class="tool-body" id="tool-body">
+      <section class="sheet" data-panel="nodes">
+        <div class="section-head"><h2>节点与链路</h2><span>选择要操作的副本</span></div>
+        <div id="node-picker" class="node-picker"></div>
+        <div class="node-tools"><h3 id="node-title">节点 A</h3><p id="node-detail"></p>
+          <div class="actions"><button id="power">停止进程</button><button id="isolate-node">隔离该节点</button><button id="connect-node">接通该节点</button><button id="lose-ack">丢弃下次写入确认</button></div>
+          <div class="fields"><label>时钟偏移（秒）<input id="offset" type="number" min="-3600" max="3600" value="-60"></label><button id="apply-clock">设置时钟</button><button id="clear-clock">恢复时钟</button></div>
+        </div>
+        <div class="subhead"><h3>有向链路</h3><label class="inline"><input id="both" type="checkbox"> 同时切换反向链路</label></div>
+        <p>行是发送方，列是接收方。点击格子切换链路配置。灰色表示端点离线。只断开 A → B 时，消息仍可能经 C 到达 B。</p>
+        <div id="matrix"></div><button id="heal-all">恢复全部链路与传输默认值</button>
+        <div class="subhead"><h3>单向传输规则</h3></div>
+        <div class="fields"><label>从<select id="rule-source" data-node-select="A"></select></label><label>到<select id="rule-target" data-node-select="B"></select></label>
+          <label>延迟（秒）<input id="rule-delay" type="number" min="0" max="120" step=".1" value="0"></label>
+          <label>每条发几份<input id="rule-copies" type="number" min="1" max="10" value="1"></label>
+          <label>丢接下来几份<input id="rule-drop" type="number" min="0" max="100" value="0"></label></div>
+        <div class="actions"><button id="set-rule" class="primary">应用到此方向</button><button id="clear-rule">移除此规则</button></div>
+        <p id="rules-view"></p>
+      </section>
+
+      <section class="sheet" data-panel="packets" hidden>
+        <div class="section-head"><h2>消息队列</h2><strong id="mode-label"></strong></div>
+        <p>先暂停自动投递，再操作购物车。选择队列里的任一份快照，可让后产生的消息先到。</p>
+        <div class="fields"><label>快照来源<select id="send-source" data-node-select="A"></select></label><label>发往<select id="send-target" data-node-select="B"></select></label><button id="send-packet" class="primary">发送当前购物车快照</button></div>
+        <div class="actions"><label class="inline"><input id="repair" type="checkbox" checked> 接收后台补同步</label><label class="inline"><input id="auto-reorder" type="checkbox"> 交替给写入消息增加 2 秒延迟</label></div>
+        <div class="subhead"><h3>待投递</h3><span id="queue-count"></span></div>
+        <div class="fields"><label>筛选方向<select id="queue-filter"></select></label><label class="inline"><input id="show-repair" type="checkbox"> 显示后台包</label><label>改延迟为（秒）<input id="packet-delay" type="number" min="0" max="120" step=".1" value="10"></label></div>
+        <div id="queue-list" class="packet-list"></div><div class="actions" id="queue-pages"></div>
+        <p>“立即投递”会跳过等待时间，仍检查链路和目标节点。复制会把同一份内容再次排入队列。</p>
+        <div class="subhead"><h3>最近投递结果</h3></div><div id="deliveries" class="scroll-list"></div>
+      </section>
+
+      <section class="sheet" data-panel="cas" hidden>
+        <div class="section-head"><h2>CAS 竞争</h2></div><p>每个节点保存自己的键值和版本。写入时，实际版本与期望版本相等才会成功。</p>
+        <label>本轮实验的键名<input id="cas-key" value="stock" maxlength="60"></label>
+        <div id="cas-lanes" class="twins"></div>
+        <div class="actions"><button id="cas-race" class="primary">同时发送两笔 CAS</button></div>
+        <p>选择同一节点可观察版本竞争，选择不同节点可比较各自的本地结果。</p>
+      </section>
+
+      <section class="sheet" data-panel="import" hidden>
+        <div class="section-head"><h2>分步迁移</h2><strong id="migration-badge">空闲</strong></div>
+        <p>选择一份可服务的副本作为来源。准备时目标切换到新的暂存数据库，原库保留在磁盘。</p>
+        <div class="fields"><label>快照来源<select id="import-source" data-node-select="A"></select></label><label>导入目标<select id="import-target" data-node-select="D"></select></label><button id="begin-import" class="primary">准备新快照</button></div>
+        <div class="progress-box"><strong id="import-label">等待准备快照</strong><progress id="import-progress" max="8" value="0"></progress><p id="import-details">准备后可逐片接收，收齐后可单独验证并提交。</p></div>
+        <div class="actions"><button data-import="step">发送下一片</button><button data-import="commit">校验并提交</button><button data-import="resume">自动完成</button><button data-import="pause">下一片后暂停</button><button data-import="cancel">中断导入</button><button id="retry-import">重新取快照</button></div>
+        <div class="subhead"><h3>中途故障</h3></div><div class="actions"><button id="import-power">停止目标进程</button><button id="import-link">断开迁移方向</button></div>
+        <p>分片走专用导入通道。节点停止或发送时链路断开会中断导入。普通复制的暂停与延迟只作用于消息队列。</p>
+      </section>
+
+      <section class="sheet" data-panel="load" hidden>
+        <div class="section-head"><h2>热点压测</h2></div>
+        <p>并发添加苹果，每轮使用独立的测试购物车。调整热点比例后再次运行，即可对照每轮的成功数、数量和耗时。</p>
+        <div class="fields"><label>写入节点<select id="load-node" data-node-select="A"></select></label><label>总请求<input id="load-count" type="number" min="2" max="320" value="24"></label><label>并发数<input id="load-workers" type="number" min="1" max="16" value="4"></label><label>热点比例（%）<input id="load-share" type="number" min="0" max="100" value="50"></label></div>
+        <div class="actions"><button id="run-load" class="primary">运行本轮负载</button><button id="stop-load" disabled>停止发新请求</button></div><p id="load-status"></p><div id="load-results"></div>
+      </section>
+
+      <section class="sheet" data-panel="history" hidden>
+        <div class="section-head"><h2>观测记录</h2><button id="export-free">导出 JSON</button></div>
+        <div class="actions"><button id="capture" class="primary">保存此刻对照</button><a href="/guide" target="_blank" rel="noopener">实验原理 ↗</a></div>
+        <p>在分区和恢复后各保存一次，可对照两次的商品、删除记录、版本和链路。</p>
+        <div id="captures"></div><h3>本页操作回执</h3><div id="action-history" class="scroll-list"></div>
+        <h3>控制器事件</h3><div id="event-history" class="scroll-list"></div>
+      </section>
+      </div>
+    </aside>
+  </div>
+  <div class="foot"><a href="/">返回引导实验</a><span>切换工具保留当前实验。复位会恢复 A/B/C，停止 D，启用自动复制并新建空车。</span></div>
+</main>
+<div id="notice" role="status" aria-live="polite"></div>
+</body>
+</html>

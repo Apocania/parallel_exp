@@ -501,5 +501,100 @@ class MessageEvidenceTests(LabCase):
         self.evidence={"client_attempts":2,"same_group_copies_delivered":3,"orange_quantity":1}
 
 
+class FreeControlTests(LabCase):
+    SYNC_INTERVAL = 60
+    REPORT = "free-control-results.json"
+
+    def ok(self, path, body=None):
+        code, data = self.call(path, body)
+        self.assertEqual(code, 200, data)
+        return data
+
+    def test_manual_reorder_copy_drop_and_delay(self):
+        """只点选指定消息：先送删除、再送旧添加，复制和丢弃均能独立核对。"""
+        self.ok("/api/network", {"manual": True, "repair_enabled": False})
+        _, added = self.operate("A")
+        def queued_write(removed):
+            return next((p for p in self.ok("/api/dispatch")["pending"]
+                         if (p["source"], p["target"], p["reason"]) == ("A", "B", "write")
+                         and p["contents"]["removed"] == removed
+                         and (removed or any(i["sku"] == "apple" for i in p["contents"]["items"]))), None)
+        old = self.until(lambda: queued_write(0))
+        tags = next(i["tags"] for i in added["cart"]["items"] if i["sku"] == "apple")
+        self.operate("A", "remove", "apple", tags)
+        new = self.until(lambda: queued_write(1))
+        self.assertEqual(self.node("B")["cart"]["tombstone_count"], 0)
+        def adjust(packet, action, **extra):
+            return self.ok("/api/dispatch/packet", {"id": packet["id"], "action": action, **extra})
+        self.assertGreater(adjust(old, "delay", delay_ms=12000)["due_at"], time.time()+10)
+        copy = adjust(new, "duplicate")
+        self.assertEqual(copy["copied_from"], new["id"])
+        self.assertEqual(adjust(copy, "drop")["status"], "dropped")
+        self.assertTrue(adjust(new, "deliver")["changed"])
+        self.assertEqual(self.node("B")["cart"]["tombstone_count"], 1)
+        late = adjust(old, "deliver")
+        self.assertTrue(late["out_of_order"])
+        self.assertFalse(late["changed"])
+        self.assertEqual(self.quantity(self.node("B"), "apple"), 0)
+        self.assertEqual(self.call("/api/dispatch/packet", {"id": old["id"], "action": "deliver"})[0], 400)
+
+    def test_directed_rules_and_reset(self):
+        """两条方向独立设置；复位清除积压与故障、启用三个默认节点并保留旧车。"""
+        self.ok("/api/network", {"manual": True, "repair_enabled": False})
+        self.ok("/api/network", {"link": {"source":"C", "target":"B", "open":False}})
+        self.ok("/api/network", {"isolate":"A"})
+        net = self.ok("/api/network", {"reconnect":"A"})
+        self.assertEqual(net["blocked"], [["C","B"]])
+        self.ok("/api/network", {"rule":{"source":"B","target":"C","copies":3,"delay_ms":12000,"drop_next":1}})
+        group = self.ok("/api/dispatch/send", {"source":"B","target":"C"})["group"]
+        q = self.ok("/api/dispatch")
+        self.assertEqual(len([p for p in q["pending"] if p["group"] == group]), 2)
+        self.assertEqual([p["status"] for p in q["recent"] if p["group"] == group], ["dropped"])
+        self.ok("/api/fault/clock", {"node":"B","offset":-137})
+        self.ok("/api/fault/reply", {"node":"C"})
+        self.ok("/api/node", {"node":"A","action":"stop"})
+        self.ok("/api/node", {"node":"D","action":"start","joining":False})
+        old_id = self.cart_id
+        self.cart_id = self.ok("/api/experiment/new", {"seed":False})["cart_id"]
+        state = self.state()
+        self.assertFalse(state["network"]["manual"])
+        self.assertTrue(state["network"]["repair_enabled"])
+        self.assertEqual(state["network"]["blocked"], [])
+        self.assertEqual(state["network"]["rules"], [])
+        self.assertEqual(state["drop_reply"], [])
+        self.assertEqual(state["compared_nodes"], list("ABC"))
+        self.assertTrue(all(n["cart"]["quantity"] == 0 and n["clock_offset"] == 0 for n in state["nodes"] if n["online"]))
+        self.assertFalse(any(p["group"] == group for p in self.ok("/api/dispatch")["pending"]))
+        self.assertEqual(self.ok("/api/status?cart_id="+old_id)["nodes"][0]["cart"]["quantity"], 1)
+
+    def test_operator_migration_retry_and_explicit_commit(self):
+        """B 向 C 导入；断链后分片中断，重取快照，收齐前后分别验证服务边界。"""
+        config = {"source":"B", "target":"C", "fresh":True, "manual":True}
+        m = self.ok("/api/migration/start", config)
+        def control(action):
+            return self.ok("/api/migration/control", {"job":m["job"],"action":action})
+        def at(sent):
+            latest = self.state()["migration"]
+            return latest["sent"] == sent and latest["status"] == "paused"
+        self.assertTrue(at(0))
+        control("step")
+        self.until(lambda: at(1))
+        self.ok("/api/network", {"link":{"source":"B","target":"C","open":False}})
+        control("step")
+        self.until(lambda: self.state()["migration"]["status"] == "interrupted")
+        self.assertEqual(self.operate("C")[0],503)
+        self.ok("/api/network", {"link":{"source":"B","target":"C","open":True}})
+        m=self.ok("/api/migration/start", {**config, "fresh":False})
+        self.assertEqual(self.call("/api/migration/control", {"job":m["job"],"action":"commit"})[0],400)
+        for sent in range(1,m["total"]+1):
+            control("step")
+            self.until(lambda: at(sent))
+        self.assertFalse(self.node("C")["ready"])
+        control("commit")
+        self.until(lambda: self.state()["migration"]["status"] == "complete")
+        self.assertTrue(self.node("C")["ready"])
+        self.wait_converged()
+
+
 if __name__ == "__main__":
     unittest.main()
