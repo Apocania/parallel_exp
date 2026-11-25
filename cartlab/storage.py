@@ -67,16 +67,18 @@ class Store:
         with self.lock, self.db:
             if not self.ready:
                 raise RuntimeError("node is importing; not ready to serve")
-            state = self._get(cart_id)
-            counter = max(int(self.meta("counter")), state["vv"].get(self.actor, 0)) + 1
-            updated, duplicate = crdt.apply(state, operation, request_id, self.actor, counter)
-            if not duplicate:
-                self._put(cart_id, updated)
-                self.db.execute("UPDATE meta SET value=? WHERE key='counter'", (str(counter),))
-            self.event("deduplicated" if duplicate else "local_write",
-                       {"cart_id": cart_id, "request_id": request_id, "operation": operation,
-                        "ack_replicas": 1, "vv": updated["vv"]})
-        # Return only after the SQLite transaction has committed.
+            return self._apply_cart_write(cart_id, operation, request_id)
+
+    def _apply_cart_write(self, cart_id, operation, request_id):
+        state = self._get(cart_id)
+        counter = max(int(self.meta("counter")), state["vv"].get(self.actor, 0)) + 1
+        updated, duplicate = crdt.apply(state, operation, request_id, self.actor, counter)
+        if not duplicate:
+            self._put(cart_id, updated)
+            self.db.execute("UPDATE meta SET value=? WHERE key='counter'", (str(counter),))
+        self.event("deduplicated" if duplicate else "local_write",
+                   {"cart_id": cart_id, "request_id": request_id, "operation": operation,
+                    "ack_replicas": 1, "vv": updated["vv"]})
         return {"duplicate": duplicate, "request_id": request_id,
                 "ack": {"node": self.node_id, "durable_replicas": 1, "persisted": True},
                 "cart": crdt.public_view(updated)}
@@ -113,7 +115,7 @@ class Store:
             row = self.db.execute("SELECT value,version FROM cas WHERE key=?", (key,)).fetchone()
             return {"value": json.loads(row[0]), "version": row[1]} if row else {"value": None, "version": 0}
 
-    def compare_swap(self, key, expected, value):
+    def compare_swap(self, key, expected, value, *, cart_id=None, request_id=None):
         with self.lock, self.db:
             if not self.ready:
                 raise RuntimeError("node is importing")
@@ -123,7 +125,10 @@ class Store:
             self.db.execute("INSERT INTO cas VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,version=excluded.version",
                             (key, crdt.canonical(value), expected + 1))
             self.event("local_cas", {"key": key, "version": expected + 1})
-            return {"swapped": True, "value": value, "version": expected + 1}
+            result = {"swapped": True, "value": value, "version": expected + 1}
+            if cart_id is not None:
+                result.update(self._apply_cart_write(cart_id, {"kind": "add", "sku": "apple"}, request_id))
+            return result
 
     def migration_begin(self, job, total, digest):
         if not 1 <= total <= 10000:

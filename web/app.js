@@ -314,19 +314,24 @@ async function remove(c,label,node,sku) {
   const s=await read(), tags=getNode(s,node)?.cart?.items.find(i=>i.sku===sku)?.tags||[];
   return op(c,label,node,"remove",sku,tags);
 }
-async function prepare(c,apple) {
+async function prepare(c,apple=false,seed=true) {
   epoch++; observedMutation=-1;
   messagesData=null;messageSelection="follow";
-  const result=await api("/api/experiment/new",{});
+  const result=await api("/api/experiment/new",{seed});
   c.cartId=result.cart_id; c.runId=uid(); c.requests={};
   pending.phone=pending.desktop=null;
   $("phone-node").value="A"; $("desktop-node").value="B";
   feedback.phone=feedback.desktop="准备初始商品，正在核对三个副本。";
-  await waitCart({milk:1});
+  await waitCart(seed?{milk:1}:{});
   if(apple) {await op(c,"initial-apple","A","add","apple"); await waitCart({milk:1,apple:1});}
   feedback.phone=feedback.desktop="初始状态已核对 · A/B/C 一致";
 }
-const runner={api,read,waitFor,waitCart,op,remove,prepare,getNode,qty,assert,
+function showClaim(client,node,message) {
+  $(client+"-node").value=node;
+  feedback[client]=message;
+  render();
+}
+const runner={api,read,waitFor,waitCart,op,remove,prepare,getNode,qty,assert,showClaim,
   network:body=>api("/api/network",body),node:(node,action)=>api("/api/node",{node,action})};
 async function guidedNext() {
   if(busy) return;

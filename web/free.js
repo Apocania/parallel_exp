@@ -35,6 +35,8 @@ let resets=false, noticeTimer, refreshTimer, reading=false, readAgain=false, pac
 let actionLog=[], captures=[], loads=[], loadJob=null;
 let requests={}, messages={}, clientViews={};
 let controllerOnline=false;
+let clockSampleAt=0;
+const clockFormat=new Intl.DateTimeFormat("zh-CN",{hour:"2-digit",minute:"2-digit",second:"2-digit",hourCycle:"h23"});
 const clientBusy = new Set();
 const activeButtons = new WeakSet();
 
@@ -105,8 +107,8 @@ const recipes = [
   ["复制或丢弃一份消息", "暂停自动投递，手机加苹果。在消息队列筛选 A → B，复制一份，再任选一份丢弃，手动投递另一份。", "丢弃的是选中的包。投递成功后 B 得到一件苹果。也可以把原件和副本都送达，检查第二次合并的结果。"],
   ["写入确认丢失与重试", "选 A，点击丢弃下次写入确认，再通过手机加苹果。保留选中的请求，点击重发原请求。也可以先把手机改连 B 再重发。", "核对第一次的 HTTP 504、相同的请求 ID 和苹果数量。跨分区重发时可能先各自确认，恢复传播后应只有一件。"],
   ["延迟与乱序", "暂停自动投递，手机在 A 加一件苹果，再移除。到消息队列筛选 A → B，先投递带删除记录的新包，后投递含苹果的旧包。", "旧包显示越序到达，B 的删除记录仍在，苹果保持为 0。要试自然延迟，给 A → B 设置 10 秒延迟，再恢复自动投递。"],
-  ["时钟回拨", "先在 A 写一次并记下 A 的版本。把 A 的时钟偏移设为 −60 秒，再写一次，观察后点击恢复时钟。", "节点显示时间回退，版本中 A 的计数继续增加。"],
-  ["CAS 同节点与跨节点", "两个 CAS 请求选同一键、同一节点、同一期望版本，一起发送。换一个新键，改为分别向 A、B 发送。", "第一次应出现 200 和 409，第二次两个节点都能在自己的版本 0 上成功。"],
+  ["时钟回拨", "先在 A 写一次并记下 A 的版本。把 A 的时钟偏移设为 −60 秒，再写一次，观察后点击恢复时钟。", "在消息队列筛选 A → B。后一笔写入的消息编号更大，A 的发出时间更早，版本中 A 的计数继续增加。"],
+  ["CAS 同节点与跨节点", "两个 CAS 请求选同一键、同一节点、同一期望版本，一起发送。复位为空车后，隔离 A，分别向 A、B 发送，再恢复链路。", "同节点一人成功，车里有 1 个苹果。跨节点两人成功，恢复后车里有 2 个。"],
   ["迁移中途失败", "准备 A → D 快照，逐片发送。中途停止 D，重启后让电脑连 D 尝试加购。再重新取快照，逐片收齐并提交。", "提交前普通写入被拒绝。提交后 D 能读写并补齐其他副本上的更新。"],
   ["热点与并发请求", "打开热点压测，保持总请求、并发数和节点相同，分别以 0% 与 50% 热点运行。", "对照每轮的热点确认写入数与实读数量，再观察吞吐、P50 和 P95。每轮数据只代表本机当次负载。"]
 ];
@@ -121,7 +123,9 @@ function deviceWindow(c,index) {
     <div class="device-chrome" aria-hidden="true">${chrome}</div>
     <div class="device-toolbar"><div><h3>${name}</h3><span id="${c}-status" class="device-status">等待读取</span></div>
       <label class="route">节点<select id="${c}-node" aria-label="${name}连接节点">${nodeOptions(ids[index],true)}</select></label></div>
-    <div class="shop-body"><div class="basket-heading"><h4>我的购物车</h4><span class="unit-count" id="${c}-quantity">—</span></div>
+    <div class="shop-body">
+      <div class="node-clock"><span id="${c}-clock-label">节点时间</span><strong id="${c}-clock">—</strong></div>
+      <div class="basket-heading"><h4>我的购物车</h4><span class="unit-count" id="${c}-quantity">—</span></div>
       <div id="${c}-items" class="basket-items"></div>
       <div class="basket-total"><span>商品合计</span><strong id="${c}-total">—</strong></div>
       <div class="last-change" id="${c}-change" role="status"></div>
@@ -193,8 +197,18 @@ function deviceAvailability(replica,cart) {
   return isolated ? {tone:"waiting",label:"副本隔离 · 可购物"} : {tone:"ok",label:"可购物"};
 }
 
+function renderClock(c) {
+  const replica=currentClientNode(c);
+  const available=controllerOnline && replica?.online && Number.isFinite(replica.wall_time);
+  const offset=available && replica.clock_offset;
+  const label=replica ? `节点 ${replica.node} 时间` : "节点时间";
+  setText(c+"-clock-label",offset ? `${label}（${offset>0?"+":""}${offset} 秒）` : label);
+  // Advance from the node's last sample using elapsed time between status reads.
+  setText(c+"-clock",available ? clockFormat.format(replica.wall_time*1000+performance.now()-clockSampleAt) : "—");
+}
 function renderClient(c) {
   const replica=currentClientNode(c);
+  renderClock(c);
   const cart=controllerOnline && replica?.online && replica.ready ? replica.cart : null;
   const status=deviceAvailability(replica,cart);
   $(c+"-status").dataset.tone=status.tone;
@@ -284,6 +298,7 @@ async function refresh() {
     const next=await api("/api/status");
     if(state && state.cart_id!==next.cart_id) clearSession();
     state=next;
+    clockSampleAt=performance.now();
     controllerOnline=true;
     setText("connection","● 已连接");
     render();
@@ -375,20 +390,26 @@ function payload(t) {
   const items=t.contents.items.map(i=>`${state.catalog[i.sku]?.name||i.sku} ×${i.quantity}`);
   return (items.join("、")||"空购物车")+` · 删除记录 ${t.contents.removed}`;
 }
+function packetSendTime(packet) {
+  const time=Number.isFinite(packet.sent_at) ? hhmmss(packet.sent_at) : "未记录";
+  return `节点 ${packet.source} 发出 ${time}`;
+}
 function renderQueue() {
   if(!dispatch) return;
   const filter=value("queue-filter");
   const match=t=>(!filter||filter===t.source+t.target)&&($("show-repair").checked||t.reason!=="repair");
   const packets=dispatch.pending.filter(match);
+  $("discard-pending").disabled=!dispatch.pending.length;
+  $("clear-history").disabled=!dispatch.recent.length;
   page=Math.min(page,Math.max(0,Math.ceil(packets.length/8)-1));
   setText("queue-badge",String(dispatch.network.queued));
   setText("queue-count",`符合筛选 ${packets.length} / 共 ${dispatch.pending.length} 份`);
   setHTML("queue-list",packets.slice(page*8,page*8+8).map(t=>`<article class="packet"><div class="packet-head">
     <b>${t.source} → ${t.target}</b><small class="packet-id">#${t.id} · ${reasonNames[t.reason]||"同步"} · 第 ${t.copy}/${t.copies} 份</small></div>
-    <p>${escaped(payload(t))} · ${(dispatch.network.manual?"已扣留 · 到期 ":"计划 ")+hhmmss(t.due_at)}${t.copied_from?" · 复制自 #"+t.copied_from:""}</p>
+    <p>${packetSendTime(t)} · ${dispatch.network.manual?"已扣留 · ":""}控制器计划投递 ${hhmmss(t.due_at)}<br>${escaped(payload(t))}${t.copied_from?" · 复制自 #"+t.copied_from:""}</p>
     <div class="actions">${Object.entries({deliver:"立即投递",duplicate:"复制一份",delay:"改延迟",drop:"丢弃"}).map(([act,label])=>`<button data-packet="${t.id}" data-adjust="${act}" aria-label="${label} #${t.id}">${label}</button>`).join("")}</div></article>`).join("") || '<p class="empty">当前筛选下没有待投递消息。</p>');
   setHTML("queue-pages",packets.length>8?`<button data-page="-1" ${page===0?"disabled":""}>上一页</button><span>${page+1}/${Math.ceil(packets.length/8)}</span><button data-page="1" ${(page+1)*8>=packets.length?"disabled":""}>下一页</button>`:"");
-  setHTML("deliveries",dispatch.recent.filter(match).slice(0,24).map(t=>`<div class="log-line"><b>#${t.id}　${t.source} → ${t.target}</b>　${statusNames[t.status]}${t.status==="delivered"?` · ${t.changed?"合并了新状态":"内容未变"} · ${hhmmss(t.delivered_at)}`:""}${t.out_of_order?" · 越序到达":""}<br><small>${escaped(payload(t))}</small></div>`).join("")||'<p class="empty">等待本轮实际投递结果。</p>');
+  setHTML("deliveries",dispatch.recent.filter(match).slice(0,24).map(t=>`<div class="log-line"><b>#${t.id}　${t.source} → ${t.target}</b>　${packetSendTime(t)} · ${statusNames[t.status]}${t.status==="delivered"?` · ${t.changed?"合并了新状态":"内容未变"} · 控制器确认 ${hhmmss(t.delivered_at)}`:""}${t.out_of_order?" · 越序到达":""}<br><small>${escaped(payload(t))}</small></div>`).join("")||'<p class="empty">等待本轮实际投递结果。</p>');
 }
 
 function renderHistory() {
@@ -437,9 +458,15 @@ async function compare(lane, method) {
   try {
     const current=method==="read" ?
       await api("/api/cas?"+new URLSearchParams({key,node:id})) :
-      await api("/api/cas",{key,node:id,expected:num(lane+"-version"),value:value(lane+"-value")});
-    if(method==="read") $(lane+"-version").value=current.version;
-    text=`HTTP 200 · ${method==="read"?"读到":"写入成功"}版本 ${current.version} · 值 ${JSON.stringify(current.value)}`;
+      await api("/api/cas",{key,node:id,cart_id:state.cart_id,expected:num(lane+"-version"),value:value(lane+"-value")});
+    if(method==="read") {
+      $(lane+"-version").value=current.version;
+      text=`HTTP 200 · 读到版本 ${current.version} · 值 ${JSON.stringify(current.value)}`;
+    } else if(current.swapped && current.ack?.persisted && current.cart?.items?.some(item=>item.sku==="apple" && item.quantity>0)) {
+      text=`HTTP 200 · 节点 ${id} 已发放 1 个苹果 · 版本 ${current.version} · 值 ${JSON.stringify(current.value)}`;
+    } else {
+      text="CAS 已返回，但服务未确认苹果入车。请重启 CartLab 服务，再换新键领取。";
+    }
   } catch(e) {
     text=e.code===409?`HTTP 409 · 版本冲突，当前版本 ${e.data.version} · 值 ${JSON.stringify(e.data.value)}`:explain(e);
   }
@@ -535,7 +562,15 @@ function readRule() {
   $("rule-copies").value=rule?.copies??state.network.copies;
   $("rule-drop").value=rule?.drop_next??0;
 }
+async function clearDispatch(scope) {
+  if(!dispatch || dispatch.cart_id!==state.cart_id) return;
+  if(scope==="pending" && !window.confirm("丢弃所有方向的待投递消息（含后台包）？这些消息将跳过投递。")) return;
+  const result=await api("/api/dispatch/clear",{cart_id:dispatch.cart_id,scope});
+  report(scope==="history" ? `已清空 ${result.cleared} 条投递历史` : `已丢弃 ${result.cleared} 份待投递消息`);
+}
 const buttons={
+  "clear-history":()=>clearDispatch("history"),
+  "discard-pending":()=>clearDispatch("pending"),
   "reset":reset,
   "dispatch-mode":()=>network({manual:!state.network.manual},state.network.manual?"已恢复自动投递":"已暂停，后续消息可逐份投递"),
   "power":()=>power(selected),
@@ -619,6 +654,7 @@ const stream=new EventSource("/api/events");
 stream.addEventListener("change",schedule);
 stream.onopen=schedule;
 stream.onerror=()=>setText("connection","通知重连中");
+setInterval(()=>{if(!document.hidden) clients.forEach(renderClock);},250);
 setInterval(()=>{if(!document.hidden && !loadJob) refresh();},8000);
 setInterval(()=>{if(!document.hidden && active==="packets" && !resets) refreshPackets().catch(()=>{});},1000);
 document.addEventListener("visibilitychange",()=>{if(!document.hidden)schedule();});

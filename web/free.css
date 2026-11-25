@@ -113,6 +113,8 @@ main { padding-block:24px 18px }
 .route { flex-direction:row; align-items:center; gap:5px; font-size:12px; color:var(--muted); white-space:nowrap }
 .route select { padding:3px 5px; min-height:29px; background:#fff; font-weight:650 }
 .shop-body { padding:14px clamp(10px,1vw,17px) 13px }
+.node-clock { display:flex; align-items:baseline; justify-content:space-between; flex-wrap:wrap; gap:4px 10px; padding-bottom:8px; margin-bottom:10px; border-bottom:1px solid var(--line); color:var(--muted); font-size:12px }
+.node-clock strong { color:var(--accent); font:600 20px/1.2 Consolas,monospace; font-variant-numeric:tabular-nums }
 .shop-body h4 { font-size:16px; line-height:1.35; letter-spacing:-.025em }
 .unit-count { border-radius:12px; padding:1px 9px; background:var(--wash); color:var(--accent); font-size:12px; font-weight:700 }
 .basket-items { margin-block:9px; min-height:73px; max-height:200px; overflow:auto; scrollbar-width:thin }
@@ -187,15 +189,15 @@ main { padding-block:24px 18px }
 .stage-details>summary span { margin-left:6px; font-weight:400; font-size:11px; color:var(--muted) }
 .recipes label { margin:8px 0 0 }.recipes p { margin:5px 0 }
 @media (width > 650px) {
-  /* Both windows use the same rows for chrome, toolbar, six shopping sections and receipt. */
+  /* Align chrome, toolbar, shopping sections and receipt across both windows. */
   .device-grid { align-items:stretch; row-gap:0 }
   .device-window, .shop-body {
     display:grid;
     grid-template-rows:subgrid;
     row-gap:0;
   }
-  .device-window { grid-row:span 9 }
-  .shop-body { grid-row:span 6 }
+  .device-window { grid-row:span 10 }
+  .shop-body { grid-row:span 7 }
   .basket-row { min-height:49px }
   .catalog { grid-auto-rows:1fr }
 }

@@ -251,7 +251,7 @@ class Lab:
         if source == target:
             raise ValueError("请选择两个不同节点")
 
-    def enqueue(self, source, carts, reason="repair", causes=(), destination=None):
+    def enqueue(self, source, carts, reason="repair", causes=(), destination=None, *, sent_at=None):
         self.url(source)
         with self.lock:
             if reason == "repair" and not self.repair_enabled:
@@ -296,7 +296,7 @@ class Lab:
                              "contents": {"items": [{"sku": i["sku"], "quantity": i["quantity"]}
                                                     for i in contents["items"]],
                                           "removed": contents["tombstone_count"]} if contents else None,
-                             "cart_id": self.cart_id, "created_at": time.time(),
+                             "cart_id": self.cart_id, "created_at": time.time(), "sent_at": sent_at,
                              "due_at": time.time() + wait,
                              "request_ids": list(carts.get(self.cart_id, {}).get("requests", {}))}
                     if self.cart_id in carts:
@@ -314,7 +314,7 @@ class Lab:
 
     @staticmethod
     def packet_view(trace):
-        fields = ("id", "group", "source", "target", "reason", "status", "due_at",
+        fields = ("id", "group", "source", "target", "reason", "status", "sent_at", "due_at",
                   "copy", "copies", "contents", "delivered_at", "changed", "out_of_order", "copied_from")
         return {name: trace[name] for name in fields if name in trace}
 
@@ -325,6 +325,22 @@ class Lab:
                     "recent": [self.packet_view(t) for t in reversed(self.recent_packets)
                                if t["status"] != "queued"]}
 
+    def clear_dispatch(self, cart_id, scope):
+        with self.control_delivery(), self.lock:
+            if cart_id != self.cart_id:
+                raise ValueError("实验已复位，请刷新队列后重试")
+            if scope == "history":
+                count = len(self.recent_packets)
+                self.recent_packets.clear()
+            elif scope == "pending":
+                count = len(self.queue)
+                while self.queue:
+                    self.failed_delivery(self.take_packet()[5], "dropped")
+            else:
+                raise ValueError("未知清理范围")
+            self.notify_messages()
+            return {"cleared": count}
+
     def send_snapshot(self, source, target):
         self.check_pair(source, target)
         cart_id = self.cart_id
@@ -334,7 +350,8 @@ class Lab:
         with self.lock:
             if cart_id != self.cart_id:
                 raise ValueError("实验已复位，请重新发送")
-            group = self.enqueue(source, {cart_id: state["cart"]["raw"]}, "manual", destination=target)
+            group = self.enqueue(source, {cart_id: state["cart"]["raw"]}, "manual", destination=target,
+                                 sent_at=state["wall_time"])
             return {"group": group}
 
     def take_packet(self, index=0):
@@ -471,17 +488,19 @@ class Lab:
                     **self.messages(cart_id),
                     "drop_reply": sorted(self.drop_reply), "uptime_seconds": round(time.time() - self.started)}
 
-    def operation(self, body):
+    def operation(self, body, *, cas=None):
         node = body["node"]
         payload = {"cart_id": valid_id(body.get("cart_id", self.cart_id)),
                    "request_id": valid_id(body["request_id"]), "operation": body["operation"]}
+        if cas is not None:
+            payload.update(cas)
         record = attempt = None
         with self.lock:
             if payload["cart_id"] == self.cart_id:
                 record, attempt = self.journal.begin(payload["cart_id"], payload["request_id"], node, payload["operation"])
                 self.notify_messages()
         try:
-            code, result = self.call(node, "/cart/operate", payload)
+            code, result = self.call(node, "/cas" if cas is not None else "/cart/operate", payload)
         except OSError:
             if record is not None:
                 with self.lock:
@@ -743,7 +762,8 @@ class LabHandler(JsonHandler):
             body = self.body()
             lab = self.server.lab
             if self.path == "/api/transport":
-                lab.enqueue(body["source"], body["carts"], body.get("reason", "repair"), body.get("causes", []))
+                lab.enqueue(body["source"], body["carts"], body.get("reason", "repair"), body.get("causes", []),
+                            sent_at=body.get("sent_at"))
                 self.send_json({"accepted": True})
             elif self.path == "/api/operation":
                 code, result = lab.operation(body)
@@ -754,6 +774,8 @@ class LabHandler(JsonHandler):
                 self.send_json(lab.new_experiment(seed=body.get("seed", True)))
             elif self.path == "/api/dispatch/send":
                 self.send_json(lab.send_snapshot(body["source"], body["target"]))
+            elif self.path == "/api/dispatch/clear":
+                self.send_json(lab.clear_dispatch(body["cart_id"], body["scope"]))
             elif self.path == "/api/dispatch/packet":
                 self.send_json(lab.adjust_packet(body))
             elif self.path == "/api/node":
@@ -781,7 +803,13 @@ class LabHandler(JsonHandler):
                     lab.record("clock", f"节点 {body['node']} 的实验时钟偏移设为 {body['offset']} 秒")
                 self.send_json(result, code)
             elif self.path == "/api/cas":
-                code, result = lab.call(body["node"], "/cas", body)
+                if "cart_id" in body:
+                    award = {"cart_id": body["cart_id"], "node": body["node"], "request_id": uuid.uuid4().hex,
+                             "operation": {"kind": "add", "sku": "apple"}}
+                    cas = {field: body[field] for field in ("key", "expected", "value")}
+                    code, result = lab.operation(award, cas=cas)
+                else:
+                    code, result = lab.call(body["node"], "/cas", body)
                 self.send_json(result, code)
             elif self.path == "/api/migration/start":
                 with lab.lifecycle_lock:
@@ -810,11 +838,13 @@ def main():
     parser.add_argument("--port", type=int, default=8760)
     parser.add_argument("--node-base-port", type=int, default=8761)
     parser.add_argument("--data-dir", default=str(ROOT / ".lab-data"))
+    parser.add_argument("--cart-id", type=valid_id, default="demo", help="open an existing cart on startup")
     parser.add_argument("--sync-interval", type=float, default=10.0)
     args = parser.parse_args()
     if args.sync_interval <= 0:
         parser.error("sync interval must be positive")
     lab = Lab(args.port, args.node_base_port, args.data_dir, args.sync_interval)
+    lab.cart_id = args.cart_id
     server = LabHTTPServer((args.host, args.port), LabHandler)
     server.daemon_threads = True
     server.lab = lab

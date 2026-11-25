@@ -63,13 +63,14 @@
         <div class="actions"><label class="inline"><input id="repair" type="checkbox" checked> 接收后台补同步</label><label class="inline"><input id="auto-reorder" type="checkbox"> 交替给写入消息增加 2 秒延迟</label></div>
         <div class="subhead"><h3>待投递</h3><span id="queue-count"></span></div>
         <div class="fields"><label>筛选方向<select id="queue-filter"></select></label><label class="inline"><input id="show-repair" type="checkbox"> 显示后台包</label><label>改延迟为（秒）<input id="packet-delay" type="number" min="0" max="120" step=".1" value="10"></label></div>
+        <div class="actions"><button id="discard-pending" disabled>丢弃全部待投递消息</button></div>
         <div id="queue-list" class="packet-list"></div><div class="actions" id="queue-pages"></div>
         <p>“立即投递”会跳过等待时间，仍检查链路和目标节点。复制会把同一份内容再次排入队列。</p>
-        <div class="subhead"><h3>最近投递结果</h3></div><div id="deliveries" class="scroll-list"></div>
+        <div class="subhead"><h3>最近投递结果</h3><button id="clear-history" disabled>清空全部投递历史</button></div><div id="deliveries" class="scroll-list"></div>
       </section>
 
       <section class="sheet" data-panel="cas" hidden>
-        <div class="section-head"><h2>CAS 竞争</h2></div><p>每个节点保存自己的键值和版本。写入时，实际版本与期望版本相等才会成功。</p>
+        <div class="section-head"><h2>CAS 竞争</h2></div><p>版本匹配时，节点记录领取人，并给当前购物车发 1 个苹果。版本冲突时不会发放。</p>
         <label>本轮实验的键名<input id="cas-key" value="stock" maxlength="60"></label>
         <div id="cas-lanes" class="twins"></div>
         <div class="actions"><button id="cas-race" class="primary">同时发送两笔 CAS</button></div>

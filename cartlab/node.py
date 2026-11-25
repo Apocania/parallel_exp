@@ -61,7 +61,12 @@ class NodeHandler(JsonHandler):
             elif self.path == "/cas":
                 if type(body["expected"]) is not int or body["expected"] < 0:
                     raise ValueError("invalid expected version")
-                result = store.compare_swap(valid_id(body["key"]), body["expected"], body["value"])
+                award = {}
+                if "cart_id" in body:
+                    award = {"cart_id": valid_id(body["cart_id"]), "request_id": valid_id(body["request_id"])}
+                result = store.compare_swap(valid_id(body["key"]), body["expected"], body["value"], **award)
+                if award and result["swapped"]:
+                    self.server.schedule_sync([award["cart_id"]], reason="write", causes=[award["request_id"]])
                 self.send_json(result, 200 if result["swapped"] else 409)
             elif self.path == "/internal/migration/begin":
                 store.migration_begin(body["job"], body["total"], body["digest"])
@@ -132,7 +137,8 @@ def main():
                 continue
             try:
                 request(args.manager + "/api/transport",
-                        {"source": args.id, "carts": snapshot, "reason": reason, "causes": causes}, timeout=2)
+                        {"source": args.id, "carts": snapshot, "reason": reason, "causes": causes,
+                         "sent_at": time.time() + store.clock_offset}, timeout=2)
             except (OSError, ValueError):
                 # Next round sends the full state again: transient loss is repaired.
                 pass

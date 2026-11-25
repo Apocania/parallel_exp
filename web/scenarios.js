@@ -7,6 +7,9 @@ const prepared = (apple=false) => ({
   run:async(p,c)=>{await p.prepare(c,apple); return "初始商品已在 A、B、C 三个副本一致，之前的故障已解除。";}
 });
 const step=(label,action,detail,expected,run)=>({label,action,detail,expected,run});
+function claimApple(p,c,node,value) {
+  return p.api("/api/cas",{node,key:c.cartId+".apple",expected:0,value,cart_id:c.cartId});
+}
 const normalItems={milk:1};
 const CartLabScenes=[
   {id:"normal",name:"正常同步",lead:"先体验没有故障的购物车。",concept:"操作后立即触发复制，另一端收到真实节点的新状态后更新。短暂的网络传输时间仍然存在。",conclusion:"两端操作都能快速传到另一端，无需手动刷新。",steps:[prepared(),
@@ -55,9 +58,37 @@ const CartLabScenes=[
   {id:"clock",name:"时钟回拨",advanced:true,lead:"机器时间倒退，逻辑版本继续向前。",concept:"本实现用逻辑计数记录版本，不用物理时间决定哪个购物车覆盖另一个。",conclusion:"物理时间回拨不会使版本计数倒退。",steps:[prepared(),
     step("回拨并写入","A 的时间倒退一分钟，再添加苹果","保留回拨前的时间和逻辑计数，再写入一次。","节点 A 的展示时间倒退，版本计数递增；商品仍正常同步。",async(p,c)=>{const before=p.getNode(await p.read(),"A");c.clockBefore=before;await p.api("/api/fault/clock",{node:"A",offset:-60});await p.op(c,"apple","A","add","apple");await p.waitCart({milk:1,apple:1});const after=p.getNode(await p.read(),"A");p.assert(after.wall_time<before.wall_time-50&&after.cart.vv[after.actor]>before.cart.vv[before.actor],"应同时观察到时间倒退与逻辑计数递增。");return `A 的时钟偏移为 ${after.clock_offset} 秒；本地逻辑计数 ${before.cart.vv[before.actor]} → ${after.cart.vv[after.actor]}，苹果已同步。`;}),
     step("恢复时钟","恢复 A 的展示时间","仅恢复实验时钟，不改变商品内容。","两端仍都有牛奶和苹果。",async(p)=>{await p.api("/api/fault/clock",{node:"A",offset:0});await p.waitCart({milk:1,apple:1});return "时钟已恢复，购物车内容未改变。";})]},
-  {id:"cas",name:"CAS 对照",advanced:true,lead:"两个请求竞争同一个节点的同一版本。",concept:"CAS 仅在一个节点内原子比较并更新。它不能让分区两侧的两个独立节点自动形成全局原子操作。",conclusion:"单节点同版本竞争只有一方成功；两个节点的本地 CAS 可以各自成功。",steps:[prepared(),
-    step("同节点竞争","两个客户端同时更新 A 的版本 0","使用同一个独立测试 key，让两次请求同时期望版本 0。","一个请求成功，另一个返回版本冲突。",async(p,c)=>{const key="cas-"+c.runId;const r=await Promise.allSettled(["手机","电脑"].map(value=>p.api("/api/cas",{node:"A",key,expected:0,value})));c.casCodes=r.map(v=>v.status==="fulfilled"?200:v.reason.status);p.assert(c.casCodes.filter(x=>x===200).length===1&&c.casCodes.filter(x=>x===409).length===1,"应该恰有一个成功和一个版本冲突。");return `手机请求：HTTP ${c.casCodes[0]}；电脑请求：HTTP ${c.casCodes[1]}。同一个版本只更新成功一次。`;}),
-    step("跨节点对照","分别更新 A、B 的本地版本 0","先隔离 A，再让两个节点各自执行本地 CAS。","两个请求都可能成功，说明它不是全局 CAS。",async(p,c)=>{await p.network({isolate:"A"});const key="separate-"+c.runId;const r=await Promise.all(["A","B"].map(node=>p.api("/api/cas",{node,key,expected:0,value:node})));p.assert(r.every(v=>v.swapped),"两个独立节点应各自成功。");await p.network({heal:true});return "A、B 分别成功。这里只保证节点内原子性，网络已恢复。";})]},
+  {id:"cas",name:"CAS 对照",advanced:true,lead:"同一个领苹果名额，两人同时领，购物车里会有几个？",concept:"每个节点独立检查领取版本。成功时在同一个本地事务中记录领取人、添加一个苹果。联网后购物车合并所有成功发放的苹果。",conclusion:"同节点发出 1 个苹果；分区两侧各发 1 个，合并后购物车有 2 个。",steps:[
+    step("准备","准备空购物车","手机和电脑共用本轮购物车，领取版本从 0 开始。","三个副本的购物车都为空。",async(p,c)=>{
+      await p.prepare(c,false,false);
+      return "空购物车已就绪，可以开始领取苹果。";
+    }),
+    step("同节点领取","手机和电脑都向 A 领苹果","两人使用同一个领取名额，都提交期望版本 0。","一人领到，一人遇到版本冲突，购物车显示苹果 ×1。",async(p,c)=>{
+      p.showClaim("phone","A","向 A 领取苹果…");
+      p.showClaim("desktop","A","向 A 领取苹果…");
+      const results=await Promise.allSettled(["手机","电脑"].map(value=>claimApple(p,c,"A",value)));
+      const codes=results.map(r=>r.status==="fulfilled" && r.value.swapped ? 200 : r.reason?.status);
+      p.assert(codes.includes(200) && codes.includes(409),"同节点应有一次领取成功和一次版本冲突。");
+      ["phone","desktop"].forEach((client,i)=>p.showClaim(client,"A",codes[i]===200?"HTTP 200 · 领到 1 个苹果":"HTTP 409 · 这个名额已被领取"));
+      await p.waitCart({apple:1});
+      return `手机 HTTP ${codes[0]}，电脑 HTTP ${codes[1]}。三个副本都读到苹果 ×1。`;
+    }),
+    step("分区领取","换一辆空车，分别向 A、B 领取","新一轮从零开始。隔离 A，手机经 A、电脑经 B 领取同一名额。","两人都领取成功。网络恢复前，手机和电脑各显示苹果 ×1。",async(p,c)=>{
+      await p.prepare(c,false,false);
+      await p.network({isolate:"A"});
+      const results=await Promise.all([claimApple(p,c,"A","手机"),claimApple(p,c,"B","电脑")]);
+      p.assert(results.every(r=>r.swapped),"两端应各自领取成功。");
+      p.showClaim("phone","A","HTTP 200 · 从 A 领到 1 个苹果");
+      p.showClaim("desktop","B","HTTP 200 · 从 B 领到 1 个苹果");
+      const state=await p.read();
+      p.assert(p.qty(state,"A","apple")===1 && p.qty(state,"B","apple")===1,"分区期间两端应各看到一个苹果。");
+      return "两笔领取都成功。手机上的苹果来自 A，电脑上的苹果来自 B。";
+    }),
+    step("恢复合并","恢复网络，查看苹果数量","让两个节点交换购物车记录。","同一辆车的两端都显示苹果 ×2。",async(p)=>{
+      await p.network({heal:true});
+      await p.waitCart({apple:2});
+      return "A、B、C 都读到苹果 ×2。两次领取各产生一个苹果，合并后都保留下来。";
+    })]},
   {id:"migration",name:"迁移中断",advanced:true,lead:"新节点只收到一半数据时，不能冒充完整副本。",concept:"数据先进入暂存区，全部收到且校验成功后才开放服务。实验会停在一半，方便你真正执行宕机。",conclusion:"不完整副本不会对外服务；重试完整导入后才能加入同步。",steps:[prepared(),
     step("导入一半","新建 D，并在导入一半时暂停","创建新一轮 D 的独立数据库，保留旧实验数据。","D 显示导入中，进度停在 4/8，尚不可服务。",async(p)=>{await p.api("/api/migration/start",{fresh:true,pause_after:4});await p.waitFor(s=>s.migration?.status==="paused",12000,"导入尚未到达中途检查点。");const s=await p.read();p.assert(!p.getNode(s,"D").ready,"D 尚不应开放服务。");return `D 已收到 ${s.migration.sent}/${s.migration.total} 片；刻意暂停在中途，等你执行下一步。`;}),
     step("中途宕机","停止 D，并检查部分数据是否可用","停止真实进程，再启动它，检查是否错误地开放服务。","D 重启后仍处于导入中，普通写入会被拒绝。",async(p,c)=>{await p.node("D","stop");await p.waitFor(s=>s.migration?.status==="interrupted",5000,"尚未记录迁移中断。");await p.node("D","start");p.assert(!p.getNode(await p.read(),"D").ready,"部分快照不能作为完整副本。");try{await p.op(c,"probe","D","add","apple");throw new Error("未完成导入的节点错误地接受了写入。");}catch(e){if(e.status!==503)throw e;}return "D 从暂存状态恢复，仍拒绝普通写入，没有暴露半份购物车。";}),

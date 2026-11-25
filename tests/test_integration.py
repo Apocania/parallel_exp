@@ -277,6 +277,30 @@ class DistributedIntegrationTests(LabCase):
         self.evidence={"same_node_status_codes":[200,409],"separate_node_status_codes":results,
                        "guarantee":"single-node atomicity only"}
 
+    def test_cas_apple_awards_visible_in_cart(self):
+        """同节点发一个苹果，跨节点分区发放后合并出两个苹果。"""
+        for nodes, count in [("AA", 1), ("AB", 2)]:
+            code, initial = self.call("/api/experiment/new", {"seed": False})
+            self.assertEqual(code, 200)
+            self.cart_id = initial["cart_id"]
+            if nodes == "AB":
+                self.call("/api/network", {"isolate": "A"})
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                claims = [pool.submit(self.call, "/api/cas", {
+                    "node": node, "cart_id": self.cart_id, "key": self.cart_id + ".apple",
+                    "expected": 0, "value": client,
+                }) for node, client in zip(nodes, ["phone", "desktop"])]
+                codes = sorted(claim.result()[0] for claim in claims)
+            self.assertEqual(codes, [200, 409] if nodes == "AA" else [200, 200])
+            if nodes == "AB":
+                for node in nodes:
+                    self.assertEqual(self.quantity(self.node(node), "apple"), 1)
+                self.call("/api/network", {"heal": True})
+            state = self.wait_converged()
+            for node in state["nodes"]:
+                if node["node"] in "ABC":
+                    self.assertEqual(self.quantity(node, "apple"), count)
+
     def test_80_hot_key_exactly_half_of_concurrent_requests(self):
         """24 个并发请求中 12 个访问同一购物车，无丢失更新。"""
         hot="hot-"+uuid.uuid4().hex
@@ -521,14 +545,18 @@ class FreeControlTests(LabCase):
                          and (removed or any(i["sku"] == "apple" for i in p["contents"]["items"]))), None)
         old = self.until(lambda: queued_write(0))
         tags = next(i["tags"] for i in added["cart"]["items"] if i["sku"] == "apple")
+        self.ok("/api/fault/clock", {"node":"A","offset":-60})
         self.operate("A", "remove", "apple", tags)
         new = self.until(lambda: queued_write(1))
+        self.assertGreater(old["sent_at"] - new["sent_at"], 50)
+        self.assertGreaterEqual(new["due_at"], old["due_at"])
         self.assertEqual(self.node("B")["cart"]["tombstone_count"], 0)
         def adjust(packet, action, **extra):
             return self.ok("/api/dispatch/packet", {"id": packet["id"], "action": action, **extra})
         self.assertGreater(adjust(old, "delay", delay_ms=12000)["due_at"], time.time()+10)
         copy = adjust(new, "duplicate")
         self.assertEqual(copy["copied_from"], new["id"])
+        self.assertEqual(copy["sent_at"], new["sent_at"])
         self.assertEqual(adjust(copy, "drop")["status"], "dropped")
         self.assertTrue(adjust(new, "deliver")["changed"])
         self.assertEqual(self.node("B")["cart"]["tombstone_count"], 1)
@@ -538,18 +566,42 @@ class FreeControlTests(LabCase):
         self.assertEqual(self.quantity(self.node("B"), "apple"), 0)
         self.assertEqual(self.call("/api/dispatch/packet", {"id": old["id"], "action": "deliver"})[0], 400)
 
+    def test_clear_dispatch_history_and_pending(self):
+        """清理历史保留待投递包，批量丢弃可核对，旧实验不能清理新实验。"""
+        self.ok("/api/network", {"manual": True, "repair_enabled": False})
+        group = self.ok("/api/dispatch/send", {"source": "A", "target": "B"})["group"]
+        packet = next(p for p in self.ok("/api/dispatch")["pending"] if p["group"] == group)
+        copy = self.ok("/api/dispatch/packet", {"id": packet["id"], "action": "duplicate"})
+        self.ok("/api/dispatch/packet", {"id": copy["id"], "action": "drop"})
+        path = "/api/dispatch/clear"
+        history = {"scope": "history", "cart_id": self.cart_id}
+        self.assertGreater(self.ok(path, history)["cleared"], 0)
+        self.assertEqual(self.ok(path, history)["cleared"], 0)
+        self.assertEqual(self.call(path, {"scope": "pending", "cart_id": "stale"})[0], 400)
+        view = self.ok("/api/dispatch")
+        self.assertFalse(view["recent"])
+        self.assertIn(packet["id"], [p["id"] for p in view["pending"]])
+        result = self.ok(path, {"scope": "pending", "cart_id": self.cart_id})
+        self.assertEqual(result["cleared"], len(view["pending"]))
+        view = self.ok("/api/dispatch")
+        self.assertEqual(view["network"]["queued"], 0)
+        self.assertFalse(view["pending"])
+        self.assertIn((packet["id"], "dropped"), [(p["id"], p["status"]) for p in view["recent"]])
+        self.assertEqual(self.quantity(self.node("A"), "milk"), 1)
+
     def test_directed_rules_and_reset(self):
         """两条方向独立设置；复位清除积压与故障、启用三个默认节点并保留旧车。"""
         self.ok("/api/network", {"manual": True, "repair_enabled": False})
         self.ok("/api/network", {"link": {"source":"C", "target":"B", "open":False}})
         self.ok("/api/network", {"isolate":"A"})
-        net = self.ok("/api/network", {"reconnect":"A"})
-        self.assertEqual(net["blocked"], [["C","B"]])
         self.ok("/api/network", {"rule":{"source":"B","target":"C","copies":3,"delay_ms":12000,"drop_next":1}})
         group = self.ok("/api/dispatch/send", {"source":"B","target":"C"})["group"]
         q = self.ok("/api/dispatch")
         self.assertEqual(len([p for p in q["pending"] if p["group"] == group]), 2)
         self.assertEqual([p["status"] for p in q["recent"] if p["group"] == group], ["dropped"])
+        # Reconnect after the manual send so recovery traffic cannot consume drop_next.
+        net = self.ok("/api/network", {"reconnect":"A"})
+        self.assertEqual(net["blocked"], [["C","B"]])
         self.ok("/api/fault/clock", {"node":"B","offset":-137})
         self.ok("/api/fault/reply", {"node":"C"})
         self.ok("/api/node", {"node":"A","action":"stop"})
